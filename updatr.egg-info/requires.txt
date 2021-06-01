@@ -1,0 +1,5 @@
+wheel
+osxphotos
+flickrapi
+PyExifTool
+pyyaml>=5.3

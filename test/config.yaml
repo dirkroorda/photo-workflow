@@ -1,0 +1,8 @@
+photoLib: ~/Pictures/test.photoslibrary
+albumName: testalbum
+dropboxDir: testalbum
+skipKeywords:
+  - my
+  - now
+authors: Dirk Roorda
+copyright: "public domain"
