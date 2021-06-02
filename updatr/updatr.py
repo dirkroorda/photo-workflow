@@ -1,10 +1,10 @@
+import re
 import os
 import sys
+import urllib
 import yaml
 from subprocess import run
 from importlib import import_module
-
-from iptcinfo3 import IPTCInfo
 
 import webbrowser
 import pprint
@@ -47,6 +47,24 @@ TOML_FILES = ("flat", "organized", "dropbox")
 
 DROPBOX_DIR = os.path.expanduser("~/Dropbox")
 DROPBOX_DIR = os.path.expanduser("~/DropboxTest")
+
+
+IPTC = (
+    ("source", "Iptc.Application2.Source", None),
+    ("credit", "Iptc.Application2.Credit", None),
+    ("copyright", "Iptc.Application2.Copyright", "Exif.Image.Copyright"),
+    ("author", "Iptc.Application2.Byline", "Exif.Image.Artist"),
+    ("writer", "Iptc.Application2.Writer", None),
+    ("caption", "Iptc.Application2.Caption", "Exif.Image.ImageDescription"),
+)
+
+IPTC_FROM_LOGICAL = {entry[0]: entry[1] for entry in IPTC}
+EXIF_FROM_LOGICAL = {entry[0]: entry[2] for entry in IPTC}
+
+CAPTION_SEP = "\n---\n"
+COLOFON_RE = re.compile(
+    r"""(?:(?:\s*\(Bron:\s*)|(?:{})).*$""".format(CAPTION_SEP), re.S
+)
 
 
 def require(moduleName):
@@ -226,13 +244,14 @@ class Make:
             for k in (
                 "albumName",
                 "authors",
-                "copyright",
                 "reportFlat",
                 "reportOrganized",
                 "reportDropbox",
                 "skipTags",
             ):
-                toml = toml.replace(f"«{k}»", getattr(C, k, None))
+                val = getattr(C, k, None)
+                if val is not None:
+                    toml = toml.replace(f"«{k}»", getattr(C, k, None))
 
             with open(tomlOutPath, "w") as fh:
                 fh.write(toml)
@@ -243,10 +262,62 @@ class Make:
         getattr(self, command)()
 
     def meta2flat(self):
-        print("meta2flat not yet implemented")
+        C = self.C
+        defaults = C.iptcDefaults
+        pyexiv2 = require("pyexiv2")
+
+        with os.scandir(C.flatDir) as it:
+            for entry in it:
+                fName = entry.name
+                if (
+                    fName.startswith(".")
+                    or not fName.endswith(".jpg")
+                    or not entry.is_file()
+                ):
+                    continue
+                inPath = f"{C.metaInDir}/{fName.removesuffix('jpg')}yaml"
+                outPath = f"{C.flatDir}/{fName}"
+
+                if os.path.exists(inPath):
+                    with open(inPath) as fh:
+                        logical = yaml.load(fh, Loader=yaml.FullLoader)
+                else:
+                    logical = {}
+
+                info = pyexiv2.ImageMetadata(outPath)
+                info.read()
+
+                actual = {}
+                for (log, iName, eName) in IPTC:
+                    val = logical.get(log, None)
+                    if val is None:
+                        val = defaults[log]
+                    actual[log] = val
+
+                actual["sourceAsUrl"] = urllib.quote_plus(actual["source"])
+                cpr = actual["copyright"]
+                caption = actual["caption"]
+
+                actual["copyright"] = cpr.format(**actual)
+                colofon = C.colofon.format(**actual)
+
+                caption = COLOFON_RE.sub("", caption)
+                actual["caption"] = f"{caption}{CAPTION_SEP}{colofon}"
+
+                for (log, iName, eName) in IPTC:
+                    val = actual[log]
+                    if iName is not None:
+                        info[iName] = [val]
+                    if eName is not None:
+                        info[eName] = val
+
+                info.write()
 
     def flat2meta(self):
         C = self.C
+        defaults = C.iptcDefaults
+
+        pyexiv2 = require("pyexiv2")
 
         with os.scandir(C.flatDir) as it:
             for entry in it:
@@ -258,13 +329,39 @@ class Make:
                 ):
                     continue
                 inPath = f"{C.flatDir}/{fName}"
-                outPath = f"{C.metaOutDir}/{fName.removesuffix('jpg')}txt"
-                info = IPTCInfo(inPath)
-                print(info)
-                break
+                outPath = f"{C.metaOutDir}/{fName.removesuffix('jpg')}yaml"
+
+                info = pyexiv2.ImageMetadata(inPath)
+                info.read()
+                iptc = {}
+                eNames = set(info.exif_keys)
+                iNames = set(info.iptc_keys)
+
+                actual = {}
+
+                for (log, iName, eName) in IPTC:
+                    iVal = [""] if iName not in iNames else info[iName].value
+                    iVal = "\n".join(iVal)
+                    eVal = "" if eName not in eNames else info[eName].value
+                    val = eVal if not iVal or eVal and len(eVal) > len(iVal) else iVal
+                    if log == "caption":
+                        val = COLOFON_RE.sub("", val)
+                    actual[log] = val
+
+                actual["sourceAsUrl"] = urllib.quote_plus(actual["source"])
+
+                for (log, iName, eName) in IPTC:
+                    val = actual[log]
+
+                    default = defaults[log]
+                    if log == "copyright":
+                        default = defaults[log].format(**actual)
+
+                    if val and val != default:
+                        iptc[log] = val
 
                 with open(outPath, "w") as exh:
-                    yaml.dump(info, exh)
+                    yaml.dump(iptc, exh, allow_unicode=True)
 
     def ph2flat(self):
         C = self.C
