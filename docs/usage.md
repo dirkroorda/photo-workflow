@@ -131,8 +131,16 @@ updatr folderName flickr
 ## Sort albums on Flickr
 
 If something has gone wrong with the synchronzation of Flickr,
-you might end up with albums whose photos are no longer chronologically sorted.
+you might end up with a wrong album structure:
+albums with the wrong contents or 
+albums whose photos are no longer chronologically sorted.
 That can be remedied by
+
+``` sh
+updatr folderName updatealbums
+```
+
+or, if only sorting is needed:
 
 ``` sh
 updatr folderName sortalbums

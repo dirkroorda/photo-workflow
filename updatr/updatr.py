@@ -31,6 +31,9 @@ COMMANDS = dict(
     sortalbums="""
     sort exisiting albums on flickr.
 """,
+    updatealbums="""
+    update albums exisiting albums on flickr.
+""",
 )
 COMMAND_STR = "\n".join(f"{k:<10} : {v}" for (k, v) in sorted(COMMANDS.items()))
 
@@ -467,6 +470,8 @@ Updated   : {updated:>4}
         unchanged = 0
         updated = 0
 
+        updates = []
+
         console("Update on Flickr ...")
         for name in photos:
             inPath = f"{C.photosDir}/{name}.jpg"
@@ -477,7 +482,10 @@ Updated   : {updated:>4}
             ):
                 unchanged += 1
                 continue
+            updates.append((name, inPath))
 
+        console(f"\t{len(updates)} updates needed")
+        for (name, inPath) in updates:
             metadata = getPhotoMeta(inPath, defaults, True)
             self.flPutPhoto(name, metadata)
             self.flPutAlbum(name, metadata)
@@ -491,6 +499,37 @@ Updated   : {updated:>4}
             f"""Synced with Flickr
 Unchanged : {unchanged:>4}
 Updated   : {updated:>4}
+"""
+        )
+
+    def updatealbums(self, flag=None):
+        C = self.C
+        defaults = C.metaDefaults
+
+        photos = self.photos
+
+        self.keywordSet = set()
+
+        console("Update all albums on Flickr ...")
+        if not getattr(self, "albumFromId", None):
+            self.flGetAlbums(contents=True)
+
+        updated = 0
+        unchanged = 0
+        for name in photos:
+            inPath = f"{C.photosDir}/{name}.jpg"
+            metadata = getPhotoMeta(inPath, defaults, True)
+            thisUpdated = self.flPutAlbum(name, metadata)
+            if thisUpdated:
+                updated += 1
+            else:
+                unchanged += 1
+
+        self.flSortAlbums()
+        console(
+            f"""Album assignments updated with Flickr
+Unchanged : {unchanged:>4} photos
+Updated   : {updated:>4} photos
 """
         )
 
@@ -545,15 +584,10 @@ Updated   : {updated:>4}
 
         console("Albums on Flickr")
         for (albumId, albumTitle) in albumFromId.items():
-            if contents:
-                albumPhotos = self.flGetPhotos(albumId)
-                console(f"\t{albumTitle:<25} {len(albumPhotos):>4} photos")
-            else:
-                console(f"\t{albumTitle}")
-
             isMain = albumTitle == mainAlbum
 
             if contents:
+                albumPhotos = self.flGetPhotos(albumId)
                 for photo in albumPhotos:
                     fileName = photo["title"]
                     if isMain:
@@ -562,6 +596,9 @@ Updated   : {updated:>4}
                         idFromPhoto[fileName] = photoId
                     else:
                         albumsFromPhoto.setdefault(fileName, set()).add(albumTitle)
+                console(f"\t{albumTitle:<25} {len(albumPhotos):>4} photos")
+            else:
+                console(f"\t{albumTitle}")
 
         console(f"\tTotal: {len(albumFromId):>4} albums on Flickr")
         if contents:
@@ -616,6 +653,7 @@ Updated   : {updated:>4}
 
         photoId = idFromPhoto[name]
 
+        updated = 0
         for k in keywords:
             albumId = idFromAlbum.get(k, None)
             if k not in albums:
@@ -625,12 +663,15 @@ Updated   : {updated:>4}
                     albumId = self.flMakeAlbum(k, photoId)
                 else:
                     FL.photosets.addPhoto(photoset_id=albumId, photo_id=photoId)
+                updated = 1
             touchedAlbums[albumId] = k
         for a in albums:
             if a not in keywords:
-                console(f"\tremove {name} from album {k}")
+                console(f"\tremove {name} from album {a}")
                 albumId = idFromAlbum[a]
                 FL.photosets.removePhoto(photoset_id=albumId, photo_id=photoId)
+                updated = 1
+        return updated
 
     def flSortAlbums(self):
         self.getDates()
