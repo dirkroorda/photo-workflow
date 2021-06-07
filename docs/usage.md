@@ -9,8 +9,6 @@ But if you subsequently change the metadata of those photos, it gets a bit trick
 those changes on Flickr without deleting and re-importing the photo.
 (We do not want to delete photos because of the comments that may have been added).
 
-Here are the rules, conditions, and capabilities.
-
 # Input
 
 Give your set of photos a name, and make a directory with that name under the `BASE` directory.
@@ -29,34 +27,34 @@ Remember that name. We refer to it as the *albumName*.
 Next to the subfolders `photos` and `metadata`, make a file `config.yaml` with contents analogous to the one found 
 [here](https://www.dropbox.com/sh/ofbei5tfewu40k5/AACTIT2CwW7MkwuWxYq3r2a5a?dl=0)
 
-```
-1.  albumName: TestSet
-2.  colofon: "Foto: {author}; bewerker: {writer}\n{copyright}"
-3.  metaDefaults:
-4.    source: "test"
-5.    credit: "https://github.com/dirkroorda/photo-workflow/blob/master/test/metadata"
-6.    author: "onbekend"
-7.    writer: "Dirk Roorda"
-8.    copyright: "© zie {credit}/{sourceAsUrl}.txt"
-9.    caption: "test photo"
-10.   keywords:
-11.     - my
-12.     - now
+``` yaml=
+albumName: TestSet
+colofon: "Foto: {author}; bewerker: {writer}\n{copyright}"
+metaDefaults:
+  source: "test"
+  credit: "https://github.com/dirkroorda/photo-workflow/blob/master/test/metadata"
+  author: "onbekend"
+  writer: "Dirk Roorda"
+  copyright: "© zie {credit}/{sourceAsUrl}.txt"
+  caption: "test photo"
+  keywords:
+    - my
+    - now
 ```
 
 Line by line:
 
 1.  the *albumName* on Flickr. We only work with photos that are in this album.
-2.  *colofon*: a template to add standard material at the end of the caption, such as a copyright notice.
-3.  *metaDefaults*: a list of metadata fields and their default values:
-4:  *source*: something that identifies the source photo (e.g. an instance of it in a public repository) 
-5:  *credit*: a public repository that holds the photo, preferably in the form of a url
-6:  *author*: maker or publisher of the original photo
-7:  *writer*: editor/compiler of the metadata of the photo
-8:  *copyright*: a template for mentioning a copyright notice.
-9:  You can use this to generate a direct link to the original in the public repository.
-10:  *caption*: description of the photo.
-11:  *keywords*: a list of keywords for the photo.
+1.  *colofon*: a template to add standard material at the end of the caption, such as a copyright notice.
+1.  *metaDefaults*: a list of metadata fields and their default values:
+1.  *source*: something that identifies the source photo (e.g. an instance of it in a public repository) 
+1.  *credit*: a public repository that holds the photo, preferably in the form of a url
+1.  *author*: maker or publisher of the original photo
+1.  *writer*: editor/compiler of the metadata of the photo
+1.  *copyright*: a template for mentioning a copyright notice.
+1.  You can use this to generate a direct link to the original in the public repository.
+1.  *caption*: description of the photo.
+1.  *keywords*: a list of keywords for the photo.
     The default acts as a list of keywords that is applied to all photos in the set.
 
 # Scenario
@@ -127,5 +125,15 @@ You can use any software to add GPS locations to your `jpg` images.
 After doing so, their modification times have changed, and you can synchronize them to Flickr by
 
 ``` sh
-updatr folderName flcikr
-```.
+updatr folderName flickr
+```
+
+## Sort albums on Flickr
+
+If something has gone wrong with the synchronzation of Flickr,
+you might end up with albums whose photos are no longer chronologically sorted.
+That can be remedied by
+
+``` sh
+updatr folderName sortalbums
+```

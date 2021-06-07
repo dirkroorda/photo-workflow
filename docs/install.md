@@ -20,11 +20,13 @@ package.
 Go to the directory where you have downloaded this and do
 
 ```
-pip install py3exiv2-{version_number}.tar.gz
+pip3 install py3exiv2-{version_number}.tar.gz
 ```
 
-[Source of above instructions](https://www.rwardrup.com/install-py3exiv2-on-macos/).
-[py3exiv2 docs](https://python3-exiv2.readthedocs.io/en/latest/index.html)
+See also:
+
+*   [Source of above instructions](https://www.rwardrup.com/install-py3exiv2-on-macos/).
+*   [py3exiv2 docs](https://python3-exiv2.readthedocs.io/en/latest/index.html)
 
 ## Updatr
 
@@ -48,3 +50,4 @@ updatr
 ```
 
 to get help on how to run update commands on sources and works within sources.
+Or read [usage](usage.md)...
