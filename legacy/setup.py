@@ -7,6 +7,7 @@ setup(
     ],
     install_requires=[
         "wheel",
+        "osxphotos",
         "flickrapi",
         "pyyaml>=5.3",
     ],
@@ -22,10 +23,10 @@ setup(
         ]
     },
     version='0.0.1',
-    description="""Flickr Updater""",
+    description="""Flickr Updater for Apple Photos""",
     author="Dirk Roorda",
     author_email="dirk.roorda@icloud..com",
-    url="https://github.com/dirkroorda/photo-workflow",
+    url="https://github.com/dirkroorda/historisch-eefde",
     keywords=[
         "apple",
         "photos",
@@ -47,7 +48,7 @@ setup(
         "Topic :: Utilities",
     ],
     long_description="""\
-Manage a photo collection on disk and then sync it to Flickr,
+Manage a photo collection in macos Photos and then sync it to Dropbox and Flickr,
 including metadata and album organization.
 """,
 )

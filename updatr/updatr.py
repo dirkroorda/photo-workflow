@@ -2,36 +2,54 @@ import re
 import os
 import sys
 import urllib
+from datetime import datetime
 import yaml
-from subprocess import run
-from importlib import import_module
 
 import webbrowser
 import pprint
+
+import pyexiv2
+import flickrapi
+
 
 pp = pprint.PrettyPrinter(indent=2)
 
 
 COMMANDS = dict(
-    meta2flat="read metadata from disk, apply it to the photos in the flat directory",
-    flat2meta="read metadata from photos in flat directory, write to local directory",
-    ph2flat="export compilation from Photos to flat directory in _local",
-    ph2organized="export compilation from Photos to organized directory in _local",
-    ph2dropbox="export compilation from Photos to organized directory on Dropbox",
-    flat2flickr="sync additions/deletions, metadata, albums with Flickr",
-    ph2fl="sync photos to flickr",
+    importmeta="""
+    apply metadata to photos,
+    only if metadata has changed or `force` is passed.
+""",
+    exportmeta="""
+    export defined metadata from photos,
+    if `full` is passed, also export default/computed values.
+""",
+    flickr="""
+    sync updates to Flickr, including metadata and album membership;
+    if force, sync all photos".
+""",
+    sortalbums="""
+    sort exisiting albums on flickr.
+""",
 )
 COMMAND_STR = "\n".join(f"{k:<10} : {v}" for (k, v) in sorted(COMMANDS.items()))
 
+IMAGE_BASE = os.path.expanduser("~/Dropbox")
+# IMAGE_BASE = os.path.expanduser("~/DropboxTest")
 
 HELP = f"""
-updatr «source» «work» «command»
+updatr source[:name] [command] [flag]
 
-source: a directory where the characteristics of works are described
-work:   the name of a yaml file in source/yaml that describes a work
+source: a directory name with a photo collection, residing under {IMAGE_BASE}
+name  : the name of a photo in the source directory.
+        If present, work only with this photo.
+        In that case, the force flag will be set and the datestamp
+        of the flickr update will be ignored and not updated.
 
-command:
+command flag:
 {COMMAND_STR}
+
+If no command is given, `flickr` is assumed.
 
 -h
 --help
@@ -40,37 +58,26 @@ help  : print help and exit
 
 
 REPO_DIR = f"{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}"
-FLICKR_CONFIG = f"{REPO_DIR}/_local/flickr.yaml"
-
-TOML_DIR = f"{REPO_DIR}/toml"
-TOML_FILES = ("flat", "organized", "dropbox")
-
-DROPBOX_DIR = os.path.expanduser("~/Dropbox")
-DROPBOX_DIR = os.path.expanduser("~/DropboxTest")
+LOCAL_DIR = f"{REPO_DIR}/_local"
+FLICKR_CONFIG = f"{LOCAL_DIR}//flickr.yaml"
+FLICKR_UPDATED = f"{LOCAL_DIR}//flickrupdated.txt"
 
 
-IPTC = (
+METADATA = (
     ("source", "Iptc.Application2.Source", None),
     ("credit", "Iptc.Application2.Credit", None),
     ("copyright", "Iptc.Application2.Copyright", "Exif.Image.Copyright"),
     ("author", "Iptc.Application2.Byline", "Exif.Image.Artist"),
     ("writer", "Iptc.Application2.Writer", None),
     ("caption", "Iptc.Application2.Caption", "Exif.Image.ImageDescription"),
+    ("keywords", "Iptc.Application2.Keywords", None),
+    ("datetime", None, "Exif.Image.DateTime"),
 )
-
-IPTC_FROM_LOGICAL = {entry[0]: entry[1] for entry in IPTC}
-EXIF_FROM_LOGICAL = {entry[0]: entry[2] for entry in IPTC}
 
 CAPTION_SEP = "\n---\n"
 COLOFON_RE = re.compile(
     r"""(?:(?:\s*\(Bron:\s*)|(?:{})).*$""".format(CAPTION_SEP), re.S
 )
-
-
-def require(moduleName):
-    module = import_module(moduleName)
-    globals()[moduleName] = module
-    return module
 
 
 def console(*args, error=False):
@@ -83,19 +90,25 @@ def pretty(data):
     print(pp.pprint(data))
 
 
+def sanitize(metadata):
+    if "source" in metadata:
+        val = metadata["source"]
+        if type(val) is not str:
+            metadata["source"] = str(val)
+
+
 def readArgs():
     class A:
         pass
 
     A.source = None
-    A.work = None
     A.command = None
 
     args = sys.argv[1:]
 
     if not len(args):
         console(HELP)
-        console("Missing source and work and command")
+        console("Missing source and command")
         return None
 
     if args[0] in {"-h", "--help", "help"}:
@@ -103,26 +116,18 @@ def readArgs():
         return None
 
     source = args[0]
+    parts = source.split(":", 1)
+    source = parts[0]
+    name = None if len(parts) == 1 else parts[1]
+
     A.source = source
+    A.name = name
     args = args[1:]
 
     if not len(args):
-        console(HELP)
-        console("Missing work and command")
-        return None
-
-    if args[0] in {"-h", "--help", "help"}:
-        console(HELP)
-        return None
-
-    work = args[0]
-    A.work = work
-    args = args[1:]
-
-    if not len(args):
-        console(HELP)
-        console("Missing command")
-        return None
+        A.command = "flickr"
+        A.flag = None
+        return A
 
     if args[0] in {"-h", "--help", "help"}:
         console(HELP)
@@ -131,7 +136,21 @@ def readArgs():
     command = args[0]
     A.command = command
     args = args[1:]
-    A.args = args
+    flag = None
+
+    if args:
+        flag = args[0]
+        if (
+            flag == "full"
+            and command != "exportmeta"
+            or flag == "force"
+            and command not in {"importmeta", "flickr"}
+        ):
+            console(HELP)
+            console(f"Unknown flag `{flag}` for command `{command}`")
+            return None
+
+    A.flag = flag
 
     if command not in COMMANDS:
         console(HELP)
@@ -147,126 +166,122 @@ def readYaml(path):
     return settings
 
 
+def getPhotoMeta(inPath, defaults, expanded):
+    info = pyexiv2.ImageMetadata(inPath)
+    info.read()
+    metadata = {}
+    eNames = set(info.exif_keys)
+    iNames = set(info.iptc_keys)
+
+    actual = {}
+
+    for (log, iName, eName) in METADATA:
+        if log == "datetime":
+            eNameOrig = f"{eName}Original"
+            val = "" if eNameOrig not in eNames else info[eNameOrig].raw_value
+            if not val:
+                val = "" if eName not in eNames else info[eName].raw_value
+        elif log == "keywords":
+            val = [""] if iName not in iNames else info[iName].raw_value
+        else:
+            iVal = [""] if iName not in iNames else info[iName].value
+            iVal = "\n".join(iVal)
+            eVal = "" if eName not in eNames else info[eName].value
+            val = eVal if not iVal or eVal and len(eVal) > len(iVal) else iVal
+            if not expanded and log == "caption":
+                val = COLOFON_RE.sub("", val)
+        actual[log] = val
+
+    actual["sourceAsUrl"] = urllib.parse.quote_plus(actual["source"])
+
+    for (log, iName, eName) in METADATA:
+        val = actual[log]
+
+        default = defaults.get(log, None)
+        if log == "copyright":
+            default = defaults[log].format(**actual)
+
+        if log == "keywords":
+            if expanded:
+                metadata[log] = sorted(val)
+            else:
+                val = set(val) - set(defaults[log])
+                if val:
+                    metadata[log] = sorted(val)
+        else:
+            if val and (expanded or val != default):
+                metadata[log] = val
+    return metadata
+
+
 class Make:
-    def __init__(self, source, work):
+    def __init__(self, source, name):
         class C:
             pass
 
         self.C = C
         self.source = source
-        self.work = work
-        self.good = True
+        self.name = name
 
         if not self.config():
-            self.good = False
+            quit()
 
     def config(self):
         C = self.C
         source = self.source
-        source = os.path.abspath(source)
-        work = self.work
+        name = self.name
 
-        good = True
+        c = dict(source=source)
 
-        c = dict(source=source, work=work)
+        configPath = f"{IMAGE_BASE}/{source}/config.yaml"
+        c["photosDir"] = f"{IMAGE_BASE}/{source}/photos"
+        c["photoName"] = name
+        c["metaDir"] = f"{IMAGE_BASE}/{source}/metadata"
 
-        inDir = f"{source}/{work}"
-        compConfig = f"{inDir}/config.yaml"
-
-        if not os.path.exists(compConfig):
-            console(f"No yaml file found for {work}: {compConfig}")
+        if not os.path.exists(configPath):
+            console(f"No yaml file found: {configPath}")
             return None
 
-        with open(compConfig) as fh:
-            settings = yaml.load(fh, Loader=yaml.FullLoader)
-            for (k, v) in settings.items():
-                if k == "skipKeywords":
-                    c["skipTags"] = "|".join(f"/{s},|{s}/," for s in v)
-                    v = set(v)
-                elif k == "photoLib":
-                    v = os.path.expanduser(v)
-                c[k] = v
+        settings = readYaml(configPath)
+        for (k, v) in settings.items():
+            c[k] = v
 
-        c["dropboxPath"] = f"{DROPBOX_DIR}/{c['dropboxDir']}"
-
-        localDir = f"{source}/_local/{work}"
-        c["localDir"] = localDir
-        c["flatDir"] = f"{localDir}/Flat"
-        c["organizedDir"] = f"{localDir}/Organized"
-        c["albumDir"] = f"{localDir}/albums"
-        c["tomlOutDir"] = f"{localDir}/toml"
-        reportDir = f"{localDir}/csv"
-        c["reportDir"] = reportDir
-        c["reportFlat"] = f"{reportDir}/flat.csv"
-        c["reportOrganized"] = f"{reportDir}/organized.csv"
-        c["reportDropbox"] = f"{reportDir}/dropbox.csv"
-        tomlDir = f"{localDir}/toml"
-        c["tomlDir"] = tomlDir
-        c["tomlFlat"] = f"{tomlDir}/flat.toml"
-        c["tomlOrganized"] = f"{tomlDir}/organized.toml"
-        c["tomlDropbox"] = f"{tomlDir}/dropbox.toml"
-
-        c["metaInDir"] = f"{inDir}/metadata"
-        c["metaOutDir"] = f"{localDir}/metadata"
+        c["metaOutDir"] = f"{LOCAL_DIR}/{source}/metadata"
+        c["metaxOutDir"] = f"{LOCAL_DIR}/{source}/metadatax"
 
         if not os.path.exists(FLICKR_CONFIG):
             console(f"No flickr config file found: {FLICKR_CONFIG}")
             return None
-        with open(FLICKR_CONFIG) as fh:
-            for (k, v) in yaml.load(fh, Loader=yaml.FullLoader).items():
-                c[k] = v
+
+        flickrSettings = readYaml(FLICKR_CONFIG)
+        for (k, v) in flickrSettings.items():
+            c[k] = v
 
         for (k, v) in c.items():
             setattr(C, k, v)
 
-        for wd in (
-            C.flatDir,
-            C.organizedDir,
-            C.metaOutDir,
-            C.tomlOutDir,
-            C.reportDir,
-            C.dropboxPath,
-        ):
+        if not self.collectPhotos():
+            return None
+
+        for wd in (C.metaOutDir, C.metaxOutDir):
             if not os.path.exists(wd):
                 os.makedirs(wd, exist_ok=True)
 
-        for tomlFile in TOML_FILES:
-            tomlInPath = f"{TOML_DIR}/{tomlFile}.toml"
-            tomlOutPath = f"{localDir}/toml/{tomlFile}.toml"
+        return True
 
-            if not os.path.exists(tomlInPath):
-                console(f"File not found: {tomlInPath}")
-                good = None
+    def doCommand(self, command, flag):
+        getattr(self, command)(flag=flag)
 
-            with open(tomlInPath) as fh:
-                toml = fh.read()
-
-            for k in (
-                "albumName",
-                "authors",
-                "reportFlat",
-                "reportOrganized",
-                "reportDropbox",
-                "skipTags",
-            ):
-                val = getattr(C, k, None)
-                if val is not None:
-                    toml = toml.replace(f"«{k}»", getattr(C, k, None))
-
-            with open(tomlOutPath, "w") as fh:
-                fh.write(toml)
-
-        return good
-
-    def doCommand(self, command):
-        getattr(self, command)()
-
-    def meta2flat(self):
+    def collectPhotos(self):
         C = self.C
-        defaults = C.iptcDefaults
-        pyexiv2 = require("pyexiv2")
 
-        with os.scandir(C.flatDir) as it:
+        if not os.path.exists(C.photosDir):
+            console(f"Photos directory `{C.photosDir}` does not exist")
+            return None
+
+        allPhotos = []
+
+        with os.scandir(C.photosDir) as it:
             for entry in it:
                 fName = entry.name
                 if (
@@ -275,255 +290,234 @@ class Make:
                     or not entry.is_file()
                 ):
                     continue
-                inPath = f"{C.metaInDir}/{fName.removesuffix('jpg')}yaml"
-                outPath = f"{C.flatDir}/{fName}"
+                name = fName.removesuffix(".jpg")
+                allPhotos.append(name)
+            console(f"Found {len(allPhotos)} photos")
+        allPhotos = tuple(sorted(allPhotos))
+        self.allPhotos = allPhotos
 
-                if os.path.exists(inPath):
-                    with open(inPath) as fh:
-                        logical = yaml.load(fh, Loader=yaml.FullLoader)
+        if C.photoName:
+            if not os.path.exists(f"{C.photosDir}/{C.photoName}.jpg"):
+                console(f"Specified photo `{C.photoName}` not found in {C.photosDir}")
+                return None
+            photos = (C.photoName,)
+            console(f"Selected {C.photoName}")
+        else:
+            photos = allPhotos
+
+        self.photos = photos
+        return True
+
+    def getKeywords(self):
+        C = self.C
+        defaults = C.metaDefaults
+
+        allPhotos = self.allPhotos
+        keywordSet = set(defaults["keywords"])
+        allKeywordSet = set(defaults["keywords"])
+        self.keywordSet = allKeywordSet
+        self.allKeywordSet = allKeywordSet
+
+        for name in allPhotos:
+            inPath = f"{C.photosDir}/{name}.jpg"
+
+            keywords = getPhotoMeta(inPath, defaults, True)["keywords"]
+            allKeywordSet |= set(keywords)
+            if name == C.photoName:
+                keywordSet |= set(keywords)
+
+    def getDates(self):
+        C = self.C
+
+        allPhotos = self.allPhotos
+        photoDates = {}
+        self.photoDates = photoDates
+
+        for name in allPhotos:
+            inPath = f"{C.metaDir}/{name}.yaml"
+
+            if os.path.exists(inPath):
+                logical = readYaml(inPath)
+                sanitize(logical)
+            else:
+                logical = {}
+
+            datetime = logical.get("datetime", "")
+            photoDates[name] = datetime
+
+    def importmeta(self, flag=None):
+        C = self.C
+        defaults = C.metaDefaults
+
+        force = flag == "force" or C.photoName
+
+        photos = self.photos
+
+        unchanged = 0
+        updated = 0
+
+        console("Apply metadata ...")
+
+        for name in photos:
+            inPath = f"{C.metaDir}/{name}.yaml"
+            outPath = f"{C.photosDir}/{name}.jpg"
+
+            if not force:
+                if not os.path.exists(inPath) or os.path.getmtime(
+                    inPath
+                ) <= os.path.getmtime(outPath):
+                    unchanged += 1
+                    continue
+
+            if os.path.exists(inPath):
+                logical = readYaml(inPath)
+                sanitize(logical)
+            else:
+                logical = {}
+
+            info = pyexiv2.ImageMetadata(outPath)
+            info.read()
+
+            actual = {}
+            for (log, iName, eName) in METADATA:
+                if log == "keywords":
+                    val = sorted(set(logical.get(log, [])) | set(defaults[log]))
                 else:
-                    logical = {}
-
-                info = pyexiv2.ImageMetadata(outPath)
-                info.read()
-
-                actual = {}
-                for (log, iName, eName) in IPTC:
                     val = logical.get(log, None)
                     if val is None:
-                        val = defaults[log]
-                    actual[log] = val
+                        val = defaults.get(log, None)
+                actual[log] = val
 
-                actual["sourceAsUrl"] = urllib.quote_plus(actual["source"])
-                cpr = actual["copyright"]
-                caption = actual["caption"]
+            if actual.get("source", None) is not None:
+                actual["sourceAsUrl"] = urllib.parse.quote_plus(actual["source"])
+            cpr = actual.get("copyright", None)
+            caption = actual.get("caption", None)
 
+            if cpr is not None:
                 actual["copyright"] = cpr.format(**actual)
-                colofon = C.colofon.format(**actual)
+            colofon = C.colofon.format(**actual)
 
+            if caption is None:
+                actual["caption"] = f"{CAPTION_SEP}{colofon}"
+            else:
                 caption = COLOFON_RE.sub("", caption)
                 actual["caption"] = f"{caption}{CAPTION_SEP}{colofon}"
 
-                for (log, iName, eName) in IPTC:
-                    val = actual[log]
-                    if iName is not None:
-                        info[iName] = [val]
-                    if eName is not None:
-                        info[eName] = val
-
-                info.write()
-
-    def flat2meta(self):
-        C = self.C
-        defaults = C.iptcDefaults
-
-        pyexiv2 = require("pyexiv2")
-
-        with os.scandir(C.flatDir) as it:
-            for entry in it:
-                fName = entry.name
-                if (
-                    fName.startswith(".")
-                    or not fName.endswith(".jpg")
-                    or not entry.is_file()
-                ):
+            for (log, iName, eName) in METADATA:
+                val = actual[log]
+                if val is None:
                     continue
-                inPath = f"{C.flatDir}/{fName}"
-                outPath = f"{C.metaOutDir}/{fName.removesuffix('jpg')}yaml"
+                if iName is not None:
+                    info[iName] = val if log == "keywords" else [val]
+                if eName is not None:
+                    info[eName] = val
+                if log == "datetime":
+                    info[f"{eName}Original"] = val
+                    (date, time) = val.split(" ")
+                    date = date.replace(":", "-")
+                    val = datetime.fromisoformat(f"{date}T{time}")
+                    info["Iptc.Application2.DateCreated"] = [val]
+                    info["Iptc.Application2.TimeCreated"] = [val]
+                    info["Iptc.Application2.DigitizationDate"] = [val]
+                    info["Iptc.Application2.DigitizationTime"] = [val]
 
-                info = pyexiv2.ImageMetadata(inPath)
-                info.read()
-                iptc = {}
-                eNames = set(info.exif_keys)
-                iNames = set(info.iptc_keys)
-
-                actual = {}
-
-                for (log, iName, eName) in IPTC:
-                    iVal = [""] if iName not in iNames else info[iName].value
-                    iVal = "\n".join(iVal)
-                    eVal = "" if eName not in eNames else info[eName].value
-                    val = eVal if not iVal or eVal and len(eVal) > len(iVal) else iVal
-                    if log == "caption":
-                        val = COLOFON_RE.sub("", val)
-                    actual[log] = val
-
-                actual["sourceAsUrl"] = urllib.quote_plus(actual["source"])
-
-                for (log, iName, eName) in IPTC:
-                    val = actual[log]
-
-                    default = defaults[log]
-                    if log == "copyright":
-                        default = defaults[log].format(**actual)
-
-                    if val and val != default:
-                        iptc[log] = val
-
-                with open(outPath, "w") as exh:
-                    yaml.dump(iptc, exh, allow_unicode=True)
-
-    def ph2flat(self):
-        C = self.C
-        run(
-            (
-                f"osxphotos export"
-                f" {C.photoLib} {C.flatDir}"
-                f" --load-config {C.tomlFlat}"
-            ),
-            shell=True,
+            info.write()
+            console(f"\tapplied to {name}")
+            updated += 1
+        console(
+            f"""Import Metadata
+Unchanged : {unchanged:>4}
+Updated   : {updated:>4}
+"""
         )
 
-    def ph2organized(self):
+    def exportmeta(self, flag=None):
+        expanded = flag == "full"
         C = self.C
-        run(
-            (
-                f"osxphotos export"
-                f" {C.photoLib} {C.organizedDir}"
-                f" --load-config {C.tomlOrganized}"
-            ),
-            shell=True,
-        )
+        defaults = C.metaDefaults
+        outDir = C.metaxOutDir if expanded else C.metaOutDir
 
-    def ph2dropbox(self):
+        photos = self.photos
+
+        for name in photos:
+            inPath = f"{C.photosDir}/{name}.jpg"
+            outPath = f"{outDir}/{name}.yaml"
+
+            metadata = getPhotoMeta(inPath, defaults, expanded)
+
+            with open(outPath, "w") as exh:
+                yaml.dump(metadata, exh, allow_unicode=True)
+
+    def flickr(self, flag=None):
         C = self.C
-        run(
-            (
-                f"osxphotos export"
-                f" {C.photoLib} {C.dropboxPath}"
-                f" --load-config {C.tomlDropbox}"
-            ),
-            shell=True,
-        )
+        defaults = C.metaDefaults
 
-    def flat2flickr(self):
-        if not getattr(self, "keywordList", None):
-            self.phGetMeta()
+        force = flag == "force" or C.photoName
+
+        photos = self.photos
+
+        self.keywordSet = set()
+        self.importmeta(flag)
+
+        flickrUpdated = None if C.photoName else self.getFlickrUpdated()
+
         if not getattr(self, "albumFromId", None):
             self.flGetAlbums()
-        self.phGetModified()
-        self.flPutModified()
-        self.flPutAlbums()
 
-    def ph2fl(self):
-        self.ph2flat()
-        self.flat2flickr()
-        self.ph2dropbox()
+        unchanged = 0
+        updated = 0
 
-    def phGetMeta(self):
-        C = self.C
-        osxphotos = require("osxphotos")
-        photosdb = osxphotos.PhotosDB(dbfile=C.photoLib)
-        photos = photosdb.photos(albums=[C.albumName])
-        keywordSet = set()
-        keywordsFromName = {}
-        descriptionsFromName = {}
-        self.keywordsFromName = keywordsFromName
-        self.descriptionsFromName = descriptionsFromName
+        console("Update on Flickr ...")
+        for name in photos:
+            inPath = f"{C.photosDir}/{name}.jpg"
+            if (
+                not force
+                and flickrUpdated
+                and datetime.fromtimestamp(os.path.getmtime(inPath)) <= flickrUpdated
+            ):
+                unchanged += 1
+                continue
 
-        for photoInfo in photos:
-            fName = photoInfo.original_filename.removesuffix(".jpg")
-            description = photoInfo.description
-            keywords = photoInfo.keywords
-            useKeywords = []
-            for keyword in keywords:
-                if keyword not in C.skipKeywords:
-                    keywordSet.add(keyword.lower())
-                    useKeywords.append(keyword)
-            useKeywords.append(C.albumName)
-            keywordsFromName[fName] = set(useKeywords)
-            descriptionsFromName[fName] = description
+            metadata = getPhotoMeta(inPath, defaults, True)
+            self.flPutPhoto(name, metadata)
+            self.flPutAlbum(name, metadata)
+            console(f"\tupdated on flickr {name}")
+            updated += 1
 
-        self.keywordList = [C.albumName.lower()] + sorted(keywordSet)
-
-    def phGetModified(self):
-        C = self.C
-        self.ph2flat()
-
-        modifications = {}
-        self.modifications = modifications
-        nNew = 0
-        nUpdated = 0
-        nDeleted = 0
-        total = 0
-
-        with open(C.reportFlat) as fh:
-            next(fh)
-            for line in fh:
-                fields = line.rstrip("\n").split(",")
-                name = fields[0].rsplit("/", 1)[1]
-                if not name.endswith(".jpg"):
-                    continue
-                name = name.removesuffix(".jpg")
-                total += 1
-                new = fields[2]
-                updated = fields[3]
-                exif_updated = fields[5]
-                deleted = fields[17]
-
-                if new == "1":
-                    modifications[name] = "new"
-                    nNew += 1
-                if new == "0" and (updated == "1" or exif_updated == "1"):
-                    modifications[name] = "updated"
-                    nUpdated += 1
-                if deleted == "1":
-                    modifications[name] = "deleted"
-                    nDeleted += 1
-
-        print(
-            f"""
-    All photos: {total:>3}
-    New:        {nNew:>3}
-    Updated:    {nUpdated:>3}
-    Deleted:    {nDeleted:>3}
-    """
+        self.flSortAlbums()
+        if not C.photoName:
+            self.setFlickrUpdated()
+        console(
+            f"""Synced with Flickr
+Unchanged : {unchanged:>4}
+Updated   : {updated:>4}
+"""
         )
 
-    def flConnect(self):
+    def sortalbums(self, flag=None):
+        self.flConnect()
+
+        console("Sort all albums on Flickr ...")
+        if not getattr(self, "albumFromId", None):
+            self.flGetAlbums(contents=False)
+
+        albumFromId = self.albumFromId
+        self.touchedAlbums = {
+            albumId: albumTitle for (albumId, albumTitle) in albumFromId.items()
+        }
+        self.flSortAlbums()
+
+    def flGetAlbums(self, contents=True):
         C = self.C
-        if not getattr(self, "flickr", None):
-            flickrapi = require("flickrapi")
-            flickr = flickrapi.FlickrAPI(
-                C.flickrKey, C.flickrSecret, format="parsed-json"
-            )
+        mainAlbum = C.albumName
 
-            if not flickr.token_valid(perms="write"):
-                flickr.get_request_token(oauth_callback="oob")
-                authorize_url = flickr.auth_url(perms="write")
-                webbrowser.open_new_tab(authorize_url)
-                verifier = str(input("Verifier code: "))
-                flickr.get_access_token(verifier)
-            self.flickr = flickr
-
-    def flGetPhotos(self, albumId):
-        C = self.C
-        flickr = self.flickr
-
-        data = flickr.photosets.getPhotos(user_id=C.flickrUserId, photoset_id=albumId)[
-            "photoset"
-        ]
-        nPages = data["pages"]
-        albumPhotos = data["photo"]
-        if nPages > 1:
-            for p in range(2, nPages + 1):
-                data = flickr.photosets.getPhotos(
-                    user_id=C.flickrUserId, photoset_id=albumId, page=p
-                )["photoset"]
-                albumPhotos.extend(data["photo"])
-        return albumPhotos
-
-    def flGetAlbums(self):
-        C = self.C
-
-        if not getattr(self, "keywordList", None):
-            self.phGetMeta()
-        keywordSet = set(self.keywordList)
+        self.getKeywords()
+        allKeywordSet = self.allKeywordSet
 
         self.flConnect()
-        flickr = self.flickr
+        FL = self.FL
 
-        allAlbums = flickr.photosets.getList(user_id=C.flickrUserId)["photosets"][
+        allAlbums = FL.photosets.getList(user_id=C.flickrUserId)["photosets"][
             "photoset"
         ]
         idFromAlbum = {}
@@ -537,101 +531,167 @@ class Make:
         self.albumFromId = albumFromId
         self.albumsFromPhoto = albumsFromPhoto
 
+        self.touchedAlbums = {}
+
         for album in allAlbums:
             albumTitle = album["title"]["_content"]
-            if albumTitle.lower() not in keywordSet:
+            if albumTitle != mainAlbum and albumTitle.lower() not in allKeywordSet:
                 continue
             albumId = album["id"]
             idFromAlbum[albumTitle] = albumId
             albumFromId[albumId] = albumTitle
+            if albumTitle == mainAlbum:
+                self.touchedAlbums[albumId] = albumTitle
 
+        console("Albums on Flickr")
         for (albumId, albumTitle) in albumFromId.items():
-            albumPhotos = self.flGetPhotos(albumId)
-            print(f"{albumTitle} {len(albumPhotos):>4} photos")
+            if contents:
+                albumPhotos = self.flGetPhotos(albumId)
+                console(f"\t{albumTitle:<25} {len(albumPhotos):>4} photos")
+            else:
+                console(f"\t{albumTitle}")
 
-            for photo in albumPhotos:
-                photoId = photo["id"]
-                fileName = photo["title"]
-                photoFromId[photoId] = fileName
-                idFromPhoto[fileName] = photoId
-                albumsFromPhoto.setdefault(fileName, set()).add(albumTitle)
+            isMain = albumTitle == mainAlbum
 
-        print(f"Total: {len(albumFromId):>4} albums on Flickr")
-        print(f"Total: {len(photoFromId):>4} photos on Flickr")
-        print(f"Total: {len(idFromPhoto):>4} titles on Flickr")
+            if contents:
+                for photo in albumPhotos:
+                    fileName = photo["title"]
+                    if isMain:
+                        photoId = photo["id"]
+                        photoFromId[photoId] = fileName
+                        idFromPhoto[fileName] = photoId
+                    else:
+                        albumsFromPhoto.setdefault(fileName, set()).add(albumTitle)
 
-    def flPutModified(self):
-        modifications = self.modifications
+        console(f"\tTotal: {len(albumFromId):>4} albums on Flickr")
+        if contents:
+            console(f"\tTotal: {len(photoFromId):>4} photos on Flickr")
+            console(f"\tTotal: {len(idFromPhoto):>4} titles on Flickr")
 
-        if not modifications:
-            print("No metadata updates")
-            return
-
-        for (name, kind) in sorted(modifications.items()):
-            if kind == "updated":
-                self.flPutPhoto(name)
-                print(f"REPLACED: {name}")
-
-    def flPutPhoto(self, name):
+    def flGetPhotos(self, albumId):
         C = self.C
-        flickr = self.flickr
+        FL = self.FL
+
+        data = FL.photosets.getPhotos(user_id=C.flickrUserId, photoset_id=albumId)[
+            "photoset"
+        ]
+        nPages = data["pages"]
+        albumPhotos = data["photo"]
+        if nPages > 1:
+            for p in range(2, nPages + 1):
+                data = FL.photosets.getPhotos(
+                    user_id=C.flickrUserId, photoset_id=albumId, page=p
+                )["photoset"]
+                albumPhotos.extend(data["photo"])
+        return albumPhotos
+
+    def flPutPhoto(self, name, metadata):
+        C = self.C
+        FL = self.FL
 
         idFromPhoto = self.idFromPhoto
-        descriptionsFromName = self.descriptionsFromName
 
-        fileName = f"{C.flatDir}/{name}.jpg"
         photoId = idFromPhoto[name]
-        with open(fileName, "rb") as fh:
-            flickr.replace(fileName, photoId, fh, format="rest")
-        description = descriptionsFromName[name]
-        if description:
-            flickr.photos.setMeta(photo_id=photoId, description=description)
+        inPath = f"{C.photosDir}/{name}.jpg"
 
-    def flPutAlbums(self):
-        flickr = self.flickr
+        with open(inPath, "rb") as fh:
+            FL.replace(inPath, photoId, fh, format="rest")
+        description = metadata.get("caption", "")
+        FL.photos.setMeta(photo_id=photoId, description=description)
+        keywords = metadata.get("keywords", [])
+        FL.photos.setTags(photo_id=photoId, tags=" ".join(keywords))
 
-        keywordsFromName = self.keywordsFromName
-        albumsFromPhoto = self.albumsFromPhoto
+    def flPutAlbum(self, name, metadata):
+        FL = self.FL
+        touchedAlbums = self.touchedAlbums
         idFromPhoto = self.idFromPhoto
         idFromAlbum = self.idFromAlbum
+        albumsFromPhoto = self.albumsFromPhoto
+        C = self.C
+        defaults = C.metaDefaults
 
-        touchedAlbums = set()
+        keywords = metadata.get("keywords", [])
+        keywords = sorted(set(keywords) - set(defaults["keywords"]))
+        albums = albumsFromPhoto.get(name, set())
 
-        for (name, photoId) in idFromPhoto.items():
-            keywords = keywordsFromName.get(name, set())
-            albums = albumsFromPhoto.get(name, set())
-            print(f"{name} {keywords=} {albums=}")
-            for k in keywords:
-                if k not in albums:
-                    print(f"add {name} to album {k}")
-                    albumId = idFromAlbum.get(k, None)
-                    if albumId is None:
-                        print(f"\tmake new album {k}")
-                        albumId = self.flMakeAlbum(k, photoId)
-                    else:
-                        flickr.photosets.addPhoto(photoset_id=albumId, photo_id=photoId)
-                    touchedAlbums.add(albumId)
-            for a in albums:
-                if a not in keywords:
-                    print(f"remove {name} from album {k}")
-                    albumId = idFromAlbum[a]
-                    flickr.photosets.removePhoto(photoset_id=albumId, photo_id=photoId)
+        photoId = idFromPhoto[name]
 
-        for albumId in sorted(touchedAlbums):
-            photos = flickr.photosets
-            photos = ",".join(photo["id"] for photo in self.flGetPhotos(albumId))
-            flickr.photosets.reorderPhotos(photoset_id=albumId, photo_ids=photos)
+        for k in keywords:
+            albumId = idFromAlbum.get(k, None)
+            if k not in albums:
+                console(f"\tadd {name} to album {k}")
+                if albumId is None:
+                    console(f"\tmake new album {k}")
+                    albumId = self.flMakeAlbum(k, photoId)
+                else:
+                    FL.photosets.addPhoto(photoset_id=albumId, photo_id=photoId)
+            touchedAlbums[albumId] = k
+        for a in albums:
+            if a not in keywords:
+                console(f"\tremove {name} from album {k}")
+                albumId = idFromAlbum[a]
+                FL.photosets.removePhoto(photoset_id=albumId, photo_id=photoId)
+
+    def flSortAlbums(self):
+        self.getDates()
+
+        FL = self.FL
+
+        touchedAlbums = self.touchedAlbums
+
+        for (albumId, albumTitle) in sorted(touchedAlbums.items(), key=lambda x: x[1]):
+            console(f"\tsorting album {albumTitle}")
+            photos = sorted(self.flGetPhotos(albumId), key=self.byDate())
+            photoIds = ",".join(photo["id"] for photo in photos)
+            FL.photosets.reorderPhotos(photoset_id=albumId, photo_ids=photoIds)
+
+    def byDate(self):
+        photoDates = self.photoDates
+
+        def dateKey(photo):
+            name = photo["title"]
+            return photoDates.get(name, "")
+
+        return dateKey
 
     def flMakeAlbum(self, name, photoId):
-        flickr = self.flickr
+        FL = self.FL
         albumFromId = self.albumFromId
         idFromAlbum = self.idFromAlbum
 
-        result = flickr.photosets.create(title=name, primary_photo_id=photoId)
+        result = FL.photosets.create(title=name, primary_photo_id=photoId)
         albumId = result["photoset"]["id"]
         albumFromId[albumId] = name
         idFromAlbum[name] = albumId
         return albumId
+
+    def flConnect(self):
+        C = self.C
+        if not getattr(self, "FL", None):
+            FL = flickrapi.FlickrAPI(C.flickrKey, C.flickrSecret, format="parsed-json")
+
+            if not FL.token_valid(perms="write"):
+                FL.get_request_token(oauth_callback="oob")
+                authorize_url = FL.auth_url(perms="write")
+                webbrowser.open_new_tab(authorize_url)
+                verifier = str(input("Verifier code: "))
+                FL.get_access_token(verifier)
+            self.FL = FL
+
+    def getFlickrUpdated(self):
+        flickrUpdated = None
+        if os.path.exists(FLICKR_UPDATED):
+            with open(FLICKR_UPDATED) as fh:
+                flickrUpdated = fh.read()
+            flickrUpdated = datetime.fromisoformat(flickrUpdated.strip())
+            console(f"Flickr last updated on {flickrUpdated.isoformat()}")
+        else:
+            console("Flickr not previously updated")
+        return flickrUpdated
+
+    def setFlickrUpdated(self):
+        with open(FLICKR_UPDATED, "w") as fh:
+            fh.write(datetime.now().isoformat())
 
 
 def main():
@@ -640,15 +700,16 @@ def main():
         return 0
 
     source = A.source
-    work = A.work
+    name = A.name
     command = A.command
+    flag = A.flag
 
-    if not work:
+    if not source:
         return
 
-    Mk = Make(source, work)
+    Mk = Make(source, name)
 
-    return Mk.doCommand(command)
+    return Mk.doCommand(command, flag=flag)
 
 
 if __name__ == "__main__":
