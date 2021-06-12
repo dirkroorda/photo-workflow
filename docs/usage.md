@@ -52,7 +52,7 @@ Line by line:
 1.  *author*: maker or publisher of the original photo
 1.  *writer*: editor/compiler of the metadata of the photo
 1.  *copyright*: a template for mentioning a copyright notice.
-1.  You can use this to generate a direct link to the original in the public repository.
+    You can use this to generate a direct link to the original in the public repository.
 1.  *caption*: description of the photo.
 1.  *keywords*: a list of keywords for the photo.
     The default acts as a list of keywords that is applied to all photos in the set.
