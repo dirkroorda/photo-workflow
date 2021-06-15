@@ -149,8 +149,10 @@ def readArgs():
     if args:
         flag = args[0]
         if (
-            flag == "full" and command != "exportmeta"
-            or flag == "force" and command not in {"importmeta", "flickr"}
+            flag == "full"
+            and command != "exportmeta"
+            or flag == "force"
+            and command not in {"importmeta", "flickr"}
             or flag not in {"full", "force"}
         ):
             console(HELP)
@@ -490,6 +492,9 @@ Updated   : {updated:>4}
             if not getattr(self, "albumFromId", None):
                 self.flGetAlbums()
 
+            self.albumAdditions = {}
+            self.albumDeletions = {}
+
             for (name, inPath) in updates:
                 metadata = getPhotoMeta(inPath, defaults, True)
                 self.flPutAlbum(name, metadata)
@@ -500,7 +505,7 @@ Updated   : {updated:>4}
                 console(f"\tupdated on flickr {name}")
                 updated += 1
 
-            self.flSortAlbums()
+            self.flApplyAlbums()
 
         if not C.photoName:
             self.setFlickrUpdated()
@@ -526,6 +531,9 @@ Updated   : {updated:>4}
 
         updated = 0
         unchanged = 0
+        self.albumAdditions = {}
+        self.albumDeletions = {}
+
         for name in photos:
             inPath = f"{C.photosDir}/{name}.jpg"
             metadata = getPhotoMeta(inPath, defaults, True)
@@ -535,8 +543,7 @@ Updated   : {updated:>4}
             else:
                 unchanged += 1
 
-        self.wait()
-        self.flSortAlbums()
+        self.flApplyAlbums()
         console(
             f"""Album assignments updated with Flickr
 Unchanged : {unchanged:>4} photos
@@ -570,6 +577,7 @@ Updated   : {updated:>4} photos
         self.flConnect()
         FL = self.FL
 
+        self.wait()
         allAlbums = FL.photosets.getList(user_id=C.flickrUserId)["photosets"][
             "photoset"
         ]
@@ -625,6 +633,7 @@ Updated   : {updated:>4} photos
         C = self.C
         FL = self.FL
 
+        self.wait()
         data = FL.photosets.getPhotos(user_id=C.flickrUserId, photoset_id=albumId)[
             "photoset"
         ]
@@ -632,6 +641,7 @@ Updated   : {updated:>4} photos
         albumPhotos = data["photo"]
         if nPages > 1:
             for p in range(2, nPages + 1):
+                self.wait()
                 data = FL.photosets.getPhotos(
                     user_id=C.flickrUserId, photoset_id=albumId, page=p
                 )["photoset"]
@@ -648,18 +658,19 @@ Updated   : {updated:>4} photos
         inPath = f"{C.photosDir}/{name}.jpg"
 
         with open(inPath, "rb") as fh:
+            self.wait()
             FL.replace(inPath, photoId, fh, format="rest")
         description = metadata.get("caption", "")
+        self.wait()
         FL.photos.setMeta(photo_id=photoId, description=description)
         keywords = metadata.get("keywords", [])
+        self.wait()
         FL.photos.setTags(photo_id=photoId, tags=" ".join(keywords))
 
     def flPutAlbum(self, name, metadata):
-        FL = self.FL
-        touchedAlbums = self.touchedAlbums
-        idFromPhoto = self.idFromPhoto
-        idFromAlbum = self.idFromAlbum
         albumsFromPhoto = self.albumsFromPhoto
+        albumAdditions = self.albumAdditions
+        albumDeletions = self.albumDeletions
         C = self.C
         defaults = C.metaDefaults
 
@@ -667,29 +678,68 @@ Updated   : {updated:>4} photos
         keywords = sorted(set(keywords) - set(defaults["keywords"]))
         albums = albumsFromPhoto.get(name, set())
 
-        photoId = idFromPhoto[name]
-
         updated = 0
         for k in keywords:
             if k in albums:
                 continue
-            albumId = idFromAlbum.get(k, None)
-            if albumId is None:
-                console(f"\tmake new album {k}")
-                albumId = self.flMakeAlbum(k, photoId)
-            else:
-                FL.photosets.addPhoto(photoset_id=albumId, photo_id=photoId)
-            console(f"\tadded {name} to album {k}")
+            albumAdditions.setdefault(k, []).append(name)
             updated = 1
-            touchedAlbums[albumId] = k
+
         for a in albums:
             if a in keywords:
                 continue
-            albumId = idFromAlbum[a]
-            FL.photosets.removePhoto(photoset_id=albumId, photo_id=photoId)
-            console(f"\tremoved {name} from album {a}")
+            albumDeletions.setdefault(a, []).append(name)
             updated = 1
         return updated
+
+    def flApplyAlbums(self):
+        FL = self.FL
+        albumAdditions = self.albumAdditions
+        albumDeletions = self.albumDeletions
+        touchedAlbums = {}
+        self.touchedAlbums = touchedAlbums
+        idFromAlbum = self.idFromAlbum
+        idFromPhoto = self.idFromPhoto
+
+        console("Apply album changes")
+        for (album, names) in sorted(albumAdditions.items()):
+            albumId = idFromAlbum.get(album, None)
+            mknew = albumId is None
+            newalbum = "new " if mknew else ""
+            touchedAlbums[albumId] = album
+            plural = "" if len(names) == 1 else "s"
+
+            console(f"\tadd to {newalbum}{album}: {len(names)} photo{plural}")
+
+            for name in names:
+                console(f"\t\t{name}")
+                photoId = idFromPhoto[name]
+                if mknew:
+                    albumId = self.flMakeAlbum(album, photoId)
+                else:
+                    self.wait()
+                    FL.photosets.addPhoto(photoset_id=albumId, photo_id=photoId)
+        for (album, names) in sorted(albumDeletions.items()):
+            albumId = idFromAlbum.get(album, None)
+            if albumId is None:
+                namesStr = ", ".join(names)
+                console(
+                    f"\twarning: trying to remove {namesStr} from empty album {album}"
+                )
+                continue
+
+            touchedAlbums[albumId] = album
+            plural = "" if len(names) == 1 else "s"
+
+            console(f"\tremove from {album}: {len(names)} photo{plural}")
+
+            for name in names:
+                console(f"\t\t{name}")
+                photoId = idFromPhoto[name]
+                self.wait()
+                FL.photosets.removePhoto(photoset_id=albumId, photo_id=photoId)
+
+        self.flSortAlbums()
 
     def flSortAlbums(self):
         self.getDates()
@@ -702,6 +752,7 @@ Updated   : {updated:>4} photos
             photos = sorted(self.flGetPhotos(albumId), key=self.byDate())
             console(f"\tsorting album {albumTitle} with {len(photos)} photos")
             photoIds = ",".join(photo["id"] for photo in photos)
+            self.wait()
             FL.photosets.reorderPhotos(photoset_id=albumId, photo_ids=photoIds)
 
     def byDate(self):
@@ -718,6 +769,7 @@ Updated   : {updated:>4} photos
         albumFromId = self.albumFromId
         idFromAlbum = self.idFromAlbum
 
+        self.wait()
         result = FL.photosets.create(title=name, primary_photo_id=photoId)
         albumId = result["photoset"]["id"]
         albumFromId[albumId] = name
@@ -740,13 +792,8 @@ Updated   : {updated:>4} photos
             self.FL = FL
 
     def wait(self):
-        # there is caching in flickr that interferes with adding photos to albums
-
-        delay = 10
-        del self.FL
-        console(f"Waiting {delay} seconds  for Flickr to settle the changes")
+        delay = 0.2
         sleep(delay)
-        self.flConnect()
 
     def getFlickrUpdated(self):
         flickrUpdated = None
