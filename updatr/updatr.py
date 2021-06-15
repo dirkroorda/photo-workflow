@@ -335,25 +335,6 @@ class Make:
             if name == C.photoName:
                 keywordSet |= set(keywords)
 
-    def getDates(self):
-        C = self.C
-
-        allPhotos = self.allPhotos
-        photoDates = {}
-        self.photoDates = photoDates
-
-        for name in allPhotos:
-            inPath = f"{C.metaDir}/{name}.yaml"
-
-            if os.path.exists(inPath):
-                logical = readYaml(inPath)
-                sanitize(logical)
-            else:
-                logical = {}
-
-            datetime = logical.get("datetime", "")
-            photoDates[name] = datetime
-
     def importmeta(self, flag=None):
         C = self.C
         defaults = C.metaDefaults
@@ -497,7 +478,7 @@ Updated   : {updated:>4}
 
             for (name, inPath) in updates:
                 metadata = getPhotoMeta(inPath, defaults, True)
-                self.flPutAlbum(name, metadata)
+                self.flPutAlbum(name, metadata, detectMetaChange=True)
 
             for (name, inPath) in updates:
                 metadata = getPhotoMeta(inPath, defaults, True)
@@ -537,7 +518,7 @@ Updated   : {updated:>4}
         for name in photos:
             inPath = f"{C.photosDir}/{name}.jpg"
             metadata = getPhotoMeta(inPath, defaults, True)
-            thisUpdated = self.flPutAlbum(name, metadata)
+            thisUpdated = self.flPutAlbum(name, metadata, detectMetaChange=False)
             if thisUpdated:
                 updated += 1
             else:
@@ -634,16 +615,17 @@ Updated   : {updated:>4} photos
         FL = self.FL
 
         self.wait()
-        data = FL.photosets.getPhotos(user_id=C.flickrUserId, photoset_id=albumId)[
-            "photoset"
-        ]
+        data = FL.photosets.getPhotos(
+            user_id=C.flickrUserId, photoset_id=albumId, extras="date_taken"
+        )["photoset"]
         nPages = data["pages"]
         albumPhotos = data["photo"]
         if nPages > 1:
             for p in range(2, nPages + 1):
                 self.wait()
                 data = FL.photosets.getPhotos(
-                    user_id=C.flickrUserId, photoset_id=albumId, page=p
+                    user_id=C.flickrUserId, photoset_id=albumId, page=p,
+                    extras="date_taken",
                 )["photoset"]
                 albumPhotos.extend(data["photo"])
         return albumPhotos
@@ -667,10 +649,12 @@ Updated   : {updated:>4} photos
         self.wait()
         FL.photos.setTags(photo_id=photoId, tags=" ".join(keywords))
 
-    def flPutAlbum(self, name, metadata):
+    def flPutAlbum(self, name, metadata, detectMetaChange=True):
+        idFromAlbum = self.idFromAlbum
         albumsFromPhoto = self.albumsFromPhoto
         albumAdditions = self.albumAdditions
         albumDeletions = self.albumDeletions
+        touchedAlbums = self.touchedAlbums
         C = self.C
         defaults = C.metaDefaults
 
@@ -680,10 +664,17 @@ Updated   : {updated:>4} photos
 
         updated = 0
         for k in keywords:
+            if detectMetaChange:
+                albumId = idFromAlbum.get(k, None)
+                if albumId is not None:
+                    touchedAlbums[albumId] = k
+                # if albumId is None, a new album will be made,
+                # it will be included in albumAdditions
+                # and hence it will enter the touched albums as well
+            updated = 1
             if k in albums:
                 continue
             albumAdditions.setdefault(k, []).append(name)
-            updated = 1
 
         for a in albums:
             if a in keywords:
@@ -696,8 +687,7 @@ Updated   : {updated:>4} photos
         FL = self.FL
         albumAdditions = self.albumAdditions
         albumDeletions = self.albumDeletions
-        touchedAlbums = {}
-        self.touchedAlbums = touchedAlbums
+        touchedAlbums = self.touchedAlbums
         idFromAlbum = self.idFromAlbum
         idFromPhoto = self.idFromPhoto
 
@@ -742,27 +732,19 @@ Updated   : {updated:>4} photos
         self.flSortAlbums()
 
     def flSortAlbums(self):
-        self.getDates()
-
         FL = self.FL
 
         touchedAlbums = self.touchedAlbums
 
+        datesNeeded = set()
+
         for (albumId, albumTitle) in sorted(touchedAlbums.items(), key=lambda x: x[1]):
-            photos = sorted(self.flGetPhotos(albumId), key=self.byDate())
+            photos = sorted(self.flGetPhotos(albumId), key=lambda p: p.get("datetaken", ""))
             console(f"\tsorting album {albumTitle} with {len(photos)} photos")
             photoIds = ",".join(photo["id"] for photo in photos)
+            datesNeeded |= {photo["title"] for photo in photos}
             self.wait()
             FL.photosets.reorderPhotos(photoset_id=albumId, photo_ids=photoIds)
-
-    def byDate(self):
-        photoDates = self.photoDates
-
-        def dateKey(photo):
-            name = photo["title"]
-            return photoDates.get(name, "")
-
-        return dateKey
 
     def flMakeAlbum(self, name, photoId):
         FL = self.FL
