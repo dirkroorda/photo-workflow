@@ -65,8 +65,8 @@ help  : print help and exit
 
 REPO_DIR = f"{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}"
 LOCAL_DIR = f"{REPO_DIR}/_local"
-FLICKR_CONFIG = f"{LOCAL_DIR}//flickr.yaml"
-FLICKR_UPDATED = f"{LOCAL_DIR}//flickrupdated.txt"
+FLICKR_CONFIG = f"{LOCAL_DIR}/flickr.yaml"
+FLICKR_UPDATED_FILE = "flickrupdated.txt"
 
 
 METADATA = (
@@ -854,9 +854,11 @@ Updated   : {updated:>4}
         sleep(delay)
 
     def getFlickrUpdated(self):
+        source = self.source
         flickrUpdated = None
-        if os.path.exists(FLICKR_UPDATED):
-            with open(FLICKR_UPDATED) as fh:
+        flUpdatePath = f"{LOCAL_DIR}/{source}-{FLICKR_UPDATED_FILE}"
+        if os.path.exists(flUpdatePath):
+            with open(flUpdatePath) as fh:
                 flickrUpdated = fh.read()
             flickrUpdated = datetime.fromisoformat(flickrUpdated.strip())
             console(f"Flickr last updated on {flickrUpdated.isoformat()}")
@@ -865,7 +867,9 @@ Updated   : {updated:>4}
         return flickrUpdated
 
     def setFlickrUpdated(self):
-        with open(FLICKR_UPDATED, "w") as fh:
+        source = self.source
+        flUpdatePath = f"{LOCAL_DIR}/{source}-{FLICKR_UPDATED_FILE}"
+        with open(flUpdatePath, "w") as fh:
             fh.write(datetime.now().isoformat())
 
 
