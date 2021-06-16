@@ -25,17 +25,17 @@ COMMANDS = dict(
     export defined metadata from photos,
     if `full` is passed, also export default/computed values.
 """,
-    flickr="""
+    sync="""
     sync updates to Flickr, including metadata and album membership;
     if force, sync all photos".
 """,
-    sortalbums="""
-    sort exisiting albums on flickr.
+    albumsort="""
+    sort existing albums on Flickr; do not sync metadata and album changes.
     You can pass a comma-separated list of albums to sort.
 """,
-    updatealbums="""
-    update albums exisiting albums on flickr.
-    You can pass a comma-separated list of albums to update.
+    albumsync="""
+    sync album memberships to Flickr, do not sync metadata changes.
+    You can pass a comma-separated list of albums to sync.
 """,
 )
 COMMAND_STR = "\n".join(f"{k:<10} : {v}" for (k, v) in sorted(COMMANDS.items()))
@@ -50,12 +50,12 @@ source: a directory name with a photo collection, residing under {IMAGE_BASE}
 name  : the name of a photo in the source directory.
         If present, work only with this photo.
         In that case, the force flag will be set and the datestamp
-        of the flickr update will be ignored and not updated.
+        of the Flickr update will be ignored and not updated.
 
 command flag:
 {COMMAND_STR}
 
-If no command is given, `flickr` is assumed.
+If no command is given, `sync` is assumed.
 
 -h
 --help
@@ -79,6 +79,7 @@ METADATA = (
     ("keywords", "Iptc.Application2.Keywords", None),
     ("datetime", None, "Exif.Image.DateTime"),
 )
+EXIF_DATE = METADATA[-1][-1]
 
 CAPTION_SEP = "\n---\n"
 COLOFON_RE = re.compile(
@@ -133,7 +134,7 @@ def readArgs():
     args = args[1:]
 
     if not len(args):
-        A.command = "flickr"
+        A.command = "sync"
         A.flag = None
         return A
 
@@ -152,7 +153,7 @@ def readArgs():
             flag == "full"
             and command != "exportmeta"
             or flag == "force"
-            and command not in {"importmeta", "flickr"}
+            and command not in {"importmeta", "sync"}
             or flag not in {"full", "force"}
         ):
             console(HELP)
@@ -173,6 +174,18 @@ def readYaml(path):
     with open(path) as fh:
         settings = yaml.load(fh, Loader=yaml.FullLoader)
     return settings
+
+
+def getPhotoDate(inPath):
+    info = pyexiv2.ImageMetadata(inPath)
+    info.read()
+    eNames = set(info.exif_keys)
+    eName = EXIF_DATE
+    eNameOrig = f"{eName}Original"
+    val = "" if eNameOrig not in eNames else info[eNameOrig].raw_value
+    if not val:
+        val = "" if eName not in eNames else info[eName].raw_value
+    return val
 
 
 def getPhotoMeta(inPath, defaults, expanded):
@@ -335,6 +348,27 @@ class Make:
             if name == C.photoName:
                 keywordSet |= set(keywords)
 
+    def getDates(self):
+        C = self.C
+
+        allPhotos = self.allPhotos
+        photoDates = {}
+        self.photoDates = photoDates
+
+        for name in allPhotos:
+            yamlFile = f"{C.metaDir}/{name}.yaml"
+
+            if os.path.exists(yamlFile):
+                logical = readYaml(yamlFile)
+                sanitize(logical)
+            else:
+                logical = {}
+
+            datetime = logical.get(
+                "datetime", getPhotoDate(f"{C.photosDir}/{name}.jpg")
+            )
+            photoDates[name] = datetime
+
     def importmeta(self, flag=None):
         C = self.C
         defaults = C.metaDefaults
@@ -438,7 +472,7 @@ Updated   : {updated:>4}
             with open(outPath, "w") as exh:
                 yaml.dump(metadata, exh, allow_unicode=True)
 
-    def flickr(self, flag=None):
+    def sync(self, flag=None):
         C = self.C
         defaults = C.metaDefaults
 
@@ -451,9 +485,6 @@ Updated   : {updated:>4}
 
         flickrUpdated = None if C.photoName else self.getFlickrUpdated()
 
-        unchanged = 0
-        updated = 0
-
         updates = []
 
         console("Update on Flickr ...")
@@ -464,32 +495,46 @@ Updated   : {updated:>4}
                 and flickrUpdated
                 and datetime.fromtimestamp(os.path.getmtime(inPath)) <= flickrUpdated
             ):
-                unchanged += 1
                 continue
             updates.append((name, inPath))
 
         console(f"\t{len(updates)} update{'' if len(updates) == 1 else 's'} needed")
         if updates:
+            console("Sync photo updates with Flickr")
+            for (name, inPath) in updates:
+                metadata = getPhotoMeta(inPath, defaults, True)
+                self.flPutPhoto(name, metadata)
+                console(f"\tupdated on Flickr {name}")
+
             if not getattr(self, "albumFromId", None):
                 self.flGetAlbums(touchMain=True)
 
             self.albumAdditions = {}
             self.albumDeletions = {}
 
-            for (name, inPath) in updates:
-                metadata = getPhotoMeta(inPath, defaults, True)
-                self.flPutAlbum(name, metadata, detectMetaChange=True)
+            unchanged = 0
+            updated = 0
 
             for (name, inPath) in updates:
                 metadata = getPhotoMeta(inPath, defaults, True)
-                self.flPutPhoto(name, metadata)
-                console(f"\tupdated on flickr {name}")
-                updated += 1
+                thisUpdated = self.flPutAlbum(name, metadata, detectMetaChange=True)
+                if thisUpdated:
+                    updated += 1
+                else:
+                    unchanged += 1
 
+            console(
+                f"""Get album membership changes:
+Unchanged : {unchanged:>4} photos
+Updated   : {updated:>4} photos
+"""
+            )
             self.flApplyAlbums()
 
         if not C.photoName:
             self.setFlickrUpdated()
+        updated = len(updates)
+        unchanged = len(photos) - updated
         console(
             f"""Synced with Flickr
 Unchanged : {unchanged:>4}
@@ -497,7 +542,7 @@ Updated   : {updated:>4}
 """
         )
 
-    def updatealbums(self, flag=None):
+    def albumsync(self, flag=None):
         C = self.C
         defaults = C.metaDefaults
 
@@ -532,8 +577,9 @@ Updated   : {updated:>4}
         )
         self.flApplyAlbums()
 
-    def sortalbums(self, flag=None):
+    def albumsort(self, flag=None):
         self.flConnect()
+        FL = self.FL
 
         albumStr = "all albums" if flag is None else f"albums {flag}"
         console(f"Sort {albumStr} on Flickr ...")
@@ -541,10 +587,16 @@ Updated   : {updated:>4}
             self.flGetAlbums(contents=False, albums=flag, touchMain=False)
 
         albumFromId = self.albumFromId
-        self.touchedAlbums = {
-            albumId: albumTitle for (albumId, albumTitle) in albumFromId.items()
-        }
-        self.flSortAlbums()
+
+        for (albumId, albumTitle) in sorted(albumFromId.items(), key=lambda x: x[1]):
+            photos = sorted(
+                self.flGetPhotos(albumId, withDates=True),
+                key=lambda p: p.get("datetaken", ""),
+            )
+            console(f"\tsorting album {albumTitle} with {len(photos)} photos")
+            photoIds = ",".join(photo["id"] for photo in photos)
+            self.wait()
+            FL.photosets.reorderPhotos(photoset_id=albumId, photo_ids=photoIds)
 
     def flGetAlbums(self, contents=True, albums=None, touchMain=True):
         C = self.C
@@ -569,10 +621,8 @@ Updated   : {updated:>4}
         albumsFromPhoto = {}
         nameFromId = {}
         idFromName = {}
-        photoFromName = {}
         self.nameFromId = nameFromId
         self.idFromName = idFromName
-        self.photoFromName = photoFromName
         self.idFromAlbum = idFromAlbum
         self.albumFromId = albumFromId
         self.albumsFromPhoto = albumsFromPhoto
@@ -600,14 +650,13 @@ Updated   : {updated:>4}
             isMain = albumTitle == mainAlbum
 
             if contents:
-                photos = self.flGetPhotos(albumId)
+                photos = self.flGetPhotos(albumId, withDates=False)
                 for photo in photos:
                     fileName = photo["title"]
                     if isMain:
                         photoId = photo["id"]
                         nameFromId[photoId] = fileName
                         idFromName[fileName] = photoId
-                        photoFromName[fileName] = photo
                     else:
                         albumsFromPhoto.setdefault(fileName, set()).add(albumTitle)
                     albumPhotos.setdefault(albumTitle, set()).add(fileName)
@@ -620,27 +669,25 @@ Updated   : {updated:>4}
             console(f"\tTotal: {len(nameFromId):>4} photos on Flickr")
             console(f"\tTotal: {len(idFromName):>4} titles on Flickr")
 
-    def flGetPhotos(self, albumId):
+    def flGetPhotos(self, albumId, withDates=False):
         C = self.C
         FL = self.FL
 
         self.wait()
+        extras = dict(extras="date_taken") if withDates else {}
         data = FL.photosets.getPhotos(
-            user_id=C.flickrUserId, photoset_id=albumId, extras="date_taken"
+            user_id=C.flickrUserId, photoset_id=albumId, **extras
         )["photoset"]
         nPages = data["pages"]
-        albumPhotos = data["photo"]
+        photos = data["photo"]
         if nPages > 1:
             for p in range(2, nPages + 1):
                 self.wait()
                 data = FL.photosets.getPhotos(
-                    user_id=C.flickrUserId,
-                    photoset_id=albumId,
-                    page=p,
-                    extras="date_taken",
+                    user_id=C.flickrUserId, photoset_id=albumId, page=p, **extras
                 )["photoset"]
-                albumPhotos.extend(data["photo"])
-        return albumPhotos
+                photos.extend(data["photo"])
+        return photos
 
     def flPutPhoto(self, name, metadata):
         C = self.C
@@ -707,7 +754,6 @@ Updated   : {updated:>4}
         idFromAlbum = self.idFromAlbum
         idFromName = self.idFromName
         nameFromId = self.nameFromId
-        photoFromName = self.photoFromName
         albumFromId = self.albumFromId
         albumPhotos = self.albumPhotos
         albumPrimary = self.albumPrimary
@@ -755,13 +801,13 @@ Updated   : {updated:>4}
 
         if touchedAlbums:
             console("Sync album changes with Flickr")
+            self.getDates()
+            photoDates = self.photoDates
 
             for (albumId, album) in sorted(touchedAlbums.items()):
                 primary = albumPrimary[album]
                 primaryName = nameFromId[primary]
-                names = sorted(
-                    albumPhotos[album], key=lambda n: photoFromName[n]["datetaken"]
-                )
+                names = sorted(albumPhotos[album], key=lambda n: photoDates[n])
                 if primaryName not in albumPhotos[album]:
                     primaryName = names[0]
                     primary = idFromName[primaryName]
@@ -774,23 +820,6 @@ Updated   : {updated:>4}
                 )
         else:
             console("No album changes to sync with Flickr")
-
-    def flSortAlbums(self):
-        FL = self.FL
-
-        touchedAlbums = self.touchedAlbums
-
-        datesNeeded = set()
-
-        for (albumId, albumTitle) in sorted(touchedAlbums.items(), key=lambda x: x[1]):
-            photos = sorted(
-                self.flGetPhotos(albumId), key=lambda p: p.get("datetaken", "")
-            )
-            console(f"\tsorting album {albumTitle} with {len(photos)} photos")
-            photoIds = ",".join(photo["id"] for photo in photos)
-            datesNeeded |= {photo["title"] for photo in photos}
-            self.wait()
-            FL.photosets.reorderPhotos(photoset_id=albumId, photo_ids=photoIds)
 
     def flMakeAlbum(self, name, photoId):
         FL = self.FL
