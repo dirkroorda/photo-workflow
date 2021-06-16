@@ -500,14 +500,14 @@ Updated   : {updated:>4}
 
         console(f"\t{len(updates)} update{'' if len(updates) == 1 else 's'} needed")
         if updates:
+            if not getattr(self, "albumFromId", None):
+                self.flGetAlbums(touchMain=True)
+
             console("Sync photo updates with Flickr")
             for (name, inPath) in updates:
                 metadata = getPhotoMeta(inPath, defaults, True)
                 self.flPutPhoto(name, metadata)
                 console(f"\tupdated on Flickr {name}")
-
-            if not getattr(self, "albumFromId", None):
-                self.flGetAlbums(touchMain=True)
 
             self.albumAdditions = {}
             self.albumDeletions = {}
