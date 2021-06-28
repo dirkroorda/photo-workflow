@@ -22,12 +22,19 @@ COMMANDS = dict(
     only if metadata has changed or `force` is passed.
 """,
     exportmeta="""
-    export defined metadata from photos,
+    export defined metadata from photos to a local directory,
     if `full` is passed, also export default/computed values.
+""",
+    exportmetafull="""
+    export full metadata from photos to the dropbox directory,
+    Full means: with default values and computed values.
+    Only when the photo is newer than the metadata file.
+    But when force, do all photos.
 """,
     sync="""
     sync updates to Flickr, including metadata and album membership;
     if force, sync all photos".
+    Also export metadata of changed photos in full.
 """,
     albumsort="""
     sort existing albums on Flickr; do not sync metadata and album changes.
@@ -153,7 +160,7 @@ def readArgs():
             flag == "full"
             and command != "exportmeta"
             or flag == "force"
-            and command not in {"importmeta", "sync"}
+            and command not in {"importmeta", "exportmetafull", "sync"}
             or flag not in {"full", "force"}
         ):
             console(HELP)
@@ -270,6 +277,7 @@ class Make:
 
         c["metaOutDir"] = f"{LOCAL_DIR}/{source}/metadata"
         c["metaxOutDir"] = f"{LOCAL_DIR}/{source}/metadatax"
+        c["metafOutDir"] = f"{IMAGE_BASE}/{source}/metadatafull"
 
         if not os.path.exists(FLICKR_CONFIG):
             console(f"No flickr config file found: {FLICKR_CONFIG}")
@@ -285,7 +293,7 @@ class Make:
         if not self.collectPhotos():
             return None
 
-        for wd in (C.metaOutDir, C.metaxOutDir):
+        for wd in (C.metaOutDir, C.metaxOutDir, C.metafOutDir):
             if not os.path.exists(wd):
                 os.makedirs(wd, exist_ok=True)
 
@@ -455,6 +463,46 @@ Updated   : {updated:>4}
 """
         )
 
+    def exportmetafull(self, flag=None):
+        C = self.C
+        defaults = C.metaDefaults
+        outDir = C.metafOutDir
+
+        photos = self.photos
+
+        force = flag == "force" or C.photoName
+
+        unchanged = 0
+        updated = 0
+
+        console("Generate full metadata ...")
+
+        for name in photos:
+            inPath = f"{C.photosDir}/{name}.jpg"
+            outPath = f"{outDir}/{name}.yaml"
+
+            if not force:
+                if not os.path.exists(inPath) or (
+                    os.path.exists(outPath)
+                    and os.path.getmtime(inPath) <= os.path.getmtime(outPath)
+                ):
+                    unchanged += 1
+                    continue
+
+            metadata = getPhotoMeta(inPath, defaults, True)
+
+            with open(outPath, "w") as exh:
+                yaml.dump(metadata, exh, allow_unicode=True)
+
+            updated += 1
+
+        console(
+            f"""Write Metadata Full
+Unchanged : {unchanged:>4}
+Updated   : {updated:>4}
+"""
+        )
+
     def exportmeta(self, flag=None):
         expanded = flag == "full"
         C = self.C
@@ -473,6 +521,7 @@ Updated   : {updated:>4}
                 yaml.dump(metadata, exh, allow_unicode=True)
 
     def sync(self, flag=None):
+        self.exportmetafull(flag=flag)
         C = self.C
         defaults = C.metaDefaults
 
