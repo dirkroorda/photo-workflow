@@ -4,7 +4,7 @@ Synchronize a set of photos with Flickr.
 
 [Install ...](docs/install.md)
 
-[Usage ...](docs.usage.md)
+[Usage ...](docs/usage.md)
 
 ## Example
 
