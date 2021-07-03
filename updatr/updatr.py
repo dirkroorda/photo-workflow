@@ -521,7 +521,6 @@ Updated   : {updated:>4}
                 yaml.dump(metadata, exh, allow_unicode=True)
 
     def sync(self, flag=None):
-        self.exportmetafull(flag=flag)
         C = self.C
         defaults = C.metaDefaults
 
@@ -531,6 +530,7 @@ Updated   : {updated:>4}
 
         self.keywordSet = set()
         self.importmeta(flag)
+        self.exportmetafull(flag=flag)
 
         flickrUpdated = None if C.photoName else self.getFlickrUpdated()
 
