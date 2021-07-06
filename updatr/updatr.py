@@ -4,6 +4,8 @@ import sys
 import urllib
 from datetime import datetime
 from time import sleep
+import fractions
+from math import modf
 import yaml
 
 import webbrowser
@@ -85,8 +87,10 @@ METADATA = (
     ("caption", "Iptc.Application2.Caption", "Exif.Image.ImageDescription"),
     ("keywords", "Iptc.Application2.Keywords", None),
     ("datetime", None, "Exif.Image.DateTime"),
+    ("location", None, None),
 )
 EXIF_DATE = METADATA[-1][-1]
+GPS = "Exif.GPSInfo.GPS"
 
 CAPTION_SEP = "\n---\n"
 COLOFON_RE = re.compile(
@@ -212,6 +216,8 @@ def getPhotoMeta(inPath, defaults, expanded):
                 val = "" if eName not in eNames else info[eName].raw_value
         elif log == "keywords":
             val = [""] if iName not in iNames else info[iName].raw_value
+        elif log == "location":
+            val = getGPS(info)
         else:
             iVal = [""] if iName not in iNames else info[iName].value
             iVal = "\n".join(iVal)
@@ -241,6 +247,87 @@ def getPhotoMeta(inPath, defaults, expanded):
             if val and (expanded or val != default):
                 metadata[log] = val
     return metadata
+
+
+class Fraction(fractions.Fraction):
+    """Only create Fractions from floats.
+
+    >>> Fraction(0.3)
+    Fraction(3, 10)
+    >>> Fraction(1.1)
+    Fraction(11, 10)
+    """
+
+    def __new__(cls, value, ignore=None):
+        """Should be compatible with Python 2.6, though untested."""
+        return fractions.Fraction.from_float(value).limit_denominator(99999)
+
+
+def dms_to_decimal(degrees, minutes, seconds, sign=" "):
+    """Convert degrees, minutes, seconds into decimal degrees.
+
+    >>> dms_to_decimal(10, 10, 10)
+    10.169444444444444
+    >>> dms_to_decimal(8, 9, 10, 'S')
+    -8.152777777777779
+    """
+    return (-1 if sign[0] in "SWsw" else 1) * (
+        float(degrees) + float(minutes) / 60 + float(seconds) / 3600
+    )
+
+
+def decimal_to_dms(decimal):
+    """Convert decimal degrees into degrees, minutes, seconds.
+
+    >>> decimal_to_dms(50.445891)
+    [Fraction(50, 1), Fraction(26, 1), Fraction(113019, 2500)]
+    >>> decimal_to_dms(-125.976893)
+    [Fraction(125, 1), Fraction(58, 1), Fraction(92037, 2500)]
+    """
+    remainder, degrees = modf(abs(decimal))
+    remainder, minutes = modf(remainder * 60)
+    return [Fraction(n) for n in (degrees, minutes, remainder * 60)]
+
+
+def getGPS(info):
+    try:
+        latitude = dms_to_decimal(
+            *info[GPS + "Latitude"].value + [info[GPS + "LatitudeRef"].value]
+        )
+        longitude = dms_to_decimal(
+            *info[GPS + "Longitude"].value + [info[GPS + "LongitudeRef"].value]
+        )
+    except KeyError:
+        latitude = ""
+        longitude = ""
+    try:
+        altitude = float(info[GPS + "Altitude"].value)
+        if int(info[GPS + "AltitudeRef"].value) > 0:
+            altitude *= -1
+    except KeyError:
+        altitude = ""
+    return f"lat={latitude} lng={longitude} alt={altitude}"
+
+
+LAT_RE = re.compile(r"lat=(\S*)")
+LNG_RE = re.compile(r"lng=(\S*)")
+ALT_RE = re.compile(r"alt=(\S*)")
+
+
+def putGPS(val, info):
+    for (field, fieldRe, refVals) in (
+        ("Latitude", LAT_RE, ("N", "S")),
+        ("Longitude", LNG_RE, ("E", "W")),
+        ("Altitude", ALT_RE, ("0", "1")),
+    ):
+        fieldVal = fieldRe.findall(val)
+        if len(fieldVal):
+            fieldVal = fieldVal[0]
+            if fieldVal:
+                fieldVal = float(fieldVal)
+                info[f"{GPS}{field}"] = decimal_to_dms(fieldVal)
+                info[f"{GPS}{field}Ref"] = refVals[0] if fieldVal >= 0 else refVals[1]
+    info[f"{GPS}MapDatum"] = "WGS-84"
 
 
 class Make:
@@ -452,6 +539,8 @@ class Make:
                     info["Iptc.Application2.TimeCreated"] = [val]
                     info["Iptc.Application2.DigitizationDate"] = [val]
                     info["Iptc.Application2.DigitizationTime"] = [val]
+                elif log == "location":
+                    putGPS(val, info)
 
             info.write()
             console(f"\tapplied to {name}")
